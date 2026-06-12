@@ -18,25 +18,22 @@
 
 import json
 import math
+import os
 import re
 import urllib.request
 from pathlib import Path
 
 import anthropic
-import nest_asyncio
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-nest_asyncio.apply()
-
 # ── CONFIG ───────────────────────────────────────────────────
-API_KEY      = "YOUR_API_KEY_HERE"   # ← your Anthropic key
+API_KEY      = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL        = "claude-sonnet-4-5"
 
-# Google Drive path (Stage 2 fix — keeps memory across Colab restarts)
-MEMORY_FILE  = Path("/content/drive/MyDrive/financial_agent/memory.json")
+MEMORY_FILE  = Path("/app/memory.json")
 MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # ── TOOL DEFINITIONS ─────────────────────────────────────────
@@ -360,14 +357,6 @@ async def clear_memory():
 
 
 # ── START ────────────────────────────────────────────────────
-from pyngrok import ngrok
-public_url = ngrok.connect(8000)
-print("=" * 50)
-print(f"  Server running!")
-print(f"  Public URL: {public_url.public_url}")
-print(f"  Paste this into index.html → Connect")
-print("=" * 50)
-
-config = uvicorn.Config(app, host="0.0.0.0", port=8000)
-server = uvicorn.Server(config)
-await server.serve()
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
