@@ -54,6 +54,7 @@ DATA_DIR = Path("/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MEMORY_FILE    = DATA_DIR / "memory.json"
 PORTFOLIO_FILE = DATA_DIR / "portfolio.json"
+TELEGRAM_HISTORY_FILE = DATA_DIR / "telegram_history.json"
 
 
 # ── STORAGE HELPERS ───────────────────────────────────────────
@@ -527,6 +528,51 @@ async def chat(request: ChatRequest):
     clean_reply, updated_profile = extract_and_update_memory(reply, profile)
     save_memory(updated_profile)
     return {"reply": clean_reply, "profile": updated_profile}
+
+
+# ── TELEGRAM TWO-WAY CHAT ─────────────────────────────────────────
+def load_telegram_history() -> list:
+    return load_json(TELEGRAM_HISTORY_FILE, [])
+
+def save_telegram_history(history: list):
+    # Keep only the last 30 messages to avoid unbounded growth
+    save_json(TELEGRAM_HISTORY_FILE, history[-30:])
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(update: dict):
+    """
+    Receives incoming Telegram messages. Configure this URL as your bot's webhook:
+    https://api.telegram.org/bot<TOKEN>/setWebhook?url=<YOUR_RAILWAY_URL>/telegram/webhook
+    """
+    message = update.get("message", {})
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    text = message.get("text", "")
+
+    # Only respond to the configured chat (security: ignore other chats)
+    if chat_id != TELEGRAM_CHAT_ID or not text:
+        return {"ok": True}
+
+    # Special commands
+    if text.strip() == "/reset":
+        save_telegram_history([])
+        send_telegram_message("Conversation history cleared. Starting fresh!")
+        return {"ok": True}
+
+    profile = load_memory()
+    system_prompt = build_system_prompt(profile)
+
+    history = load_telegram_history()
+    history.append({"role": "user", "content": text})
+
+    reply = run_agent(history, system_prompt)
+    clean_reply, updated_profile = extract_and_update_memory(reply, profile)
+    save_memory(updated_profile)
+
+    history.append({"role": "assistant", "content": clean_reply})
+    save_telegram_history(history)
+
+    send_telegram_message(clean_reply)
+    return {"ok": True}
 
 @app.get("/memory")
 async def get_memory():
