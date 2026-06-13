@@ -36,7 +36,7 @@ from pathlib import Path
 
 import anthropic
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -517,11 +517,24 @@ def evening_briefing():
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ── SIMPLE PASSWORD PROTECTION ────────────────────────────────────
+# Set WEB_UI_PASSWORD in Railway env vars. The web UI sends this back
+# as a header on every request. Telegram webhook is unaffected (it's
+# already secured by chat_id check).
+WEB_UI_PASSWORD = os.environ.get("WEB_UI_PASSWORD", "")
+
+def check_password(x_app_password: str = Header(default="")):
+    if not WEB_UI_PASSWORD:
+        return  # no password configured — open access (not recommended)
+    if x_app_password != WEB_UI_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid or missing password")
+
 class ChatRequest(BaseModel):
     messages: list[dict]
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, x_app_password: str = Header(default="")):
+    check_password(x_app_password)
     profile = load_memory()
     system_prompt = build_system_prompt(profile)
     reply = run_agent(request.messages, system_prompt)
@@ -575,16 +588,19 @@ async def telegram_webhook(update: dict):
     return {"ok": True}
 
 @app.get("/memory")
-async def get_memory():
+async def get_memory(x_app_password: str = Header(default="")):
+    check_password(x_app_password)
     return load_memory()
 
 @app.delete("/memory")
-async def clear_memory():
+async def clear_memory(x_app_password: str = Header(default="")):
+    check_password(x_app_password)
     save_memory({})
     return {"status": "memory cleared"}
 
 @app.get("/portfolio")
-async def get_portfolio():
+async def get_portfolio(x_app_password: str = Header(default="")):
+    check_password(x_app_password)
     return get_portfolio_summary()
 
 @app.post("/briefing/test")
