@@ -22,7 +22,8 @@
 #   ANTHROPIC_API_KEY
 #   TELEGRAM_BOT_TOKEN
 #   TELEGRAM_CHAT_ID
-#   BRIEFING_HOUR_UTC   (e.g. "6" for 6 AM UTC ≈ 9 AM Riyadh)
+#   BRIEFING_HOUR_UTC_1 (e.g. "6" for 6 AM UTC ≈ 9 AM Riyadh — morning briefing)
+#   BRIEFING_HOUR_UTC_2 (e.g. "16" for 4 PM UTC ≈ 7 PM Riyadh — evening briefing)
 # ============================================================
 
 import json
@@ -44,7 +45,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 API_KEY            = os.environ["ANTHROPIC_API_KEY"]
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
-BRIEFING_HOUR_UTC  = int(os.environ.get("BRIEFING_HOUR_UTC", "6"))  # default 6 AM UTC
+BRIEFING_HOUR_UTC_1 = int(os.environ.get("BRIEFING_HOUR_UTC_1", "6"))   # ~9 AM Riyadh
+BRIEFING_HOUR_UTC_2 = int(os.environ.get("BRIEFING_HOUR_UTC_2", "16"))  # ~7 PM Riyadh
 
 MODEL = "claude-sonnet-4-5"
 
@@ -425,23 +427,73 @@ def send_telegram_message(text: str):
             print(f"Telegram send error: {e}")
 
 
-# ── DAILY BRIEFING ────────────────────────────────────────────────
-def daily_briefing():
-    """Generates and sends the daily market briefing via Telegram."""
-    print(f"[{datetime.now()}] Running daily briefing...")
+# ── USER BRIEFING PREFERENCES ────────────────────────────────────
+# Edit these anytime to change what the briefing focuses on.
+SECTORS_OF_INTEREST = ["technology", "oil & energy", "retail", "transportation", "consumer staples"]
+EXCLUDED_AREAS = [
+    "media/entertainment (e.g. Netflix-type companies)",
+    "defense-reliant companies (e.g. Boeing, Palantir)",
+    "insurance",
+    "alcohol & beverages",
+    "bonds",
+    "cryptocurrency"
+]
+
+def daily_briefing(slot: str = "morning"):
+    """
+    Generates and sends a market briefing via Telegram.
+    slot: "morning" (pre-market/open focus, 9 AM Riyadh) or
+          "evening" (recap of US session + TASI close, 7 PM Riyadh)
+    """
+    print(f"[{datetime.now()}] Running {slot} briefing...")
     profile = load_memory()
     system_prompt = build_system_prompt(profile)
 
     today_str = datetime.now().strftime("%A, %B %d, %Y")
-    prompt = f"""Today's date is {today_str}. Generate my daily financial briefing for today. Include:
+    sectors_str = ", ".join(SECTORS_OF_INTEREST)
+    excluded_str = "; ".join(EXCLUDED_AREAS)
 
-1. **Portfolio summary** — use get_portfolio_summary. Show total gain/loss and each holding's daily change.
-2. **Market overview** — use get_market_news with query "stock market" for general market news today.
-3. **News on my holdings** — for each stock I own, use get_market_news with that symbol to check for any significant news (especially earnings).
-4. **Opportunities** — based on the news and price movements, mention 1-2 potential short-term considerations (NOT direct buy/sell instructions, just things worth watching).
+    if slot == "morning":
+        time_context = (
+            "This is the MORNING briefing (9 AM Riyadh time). Focus on: overnight US market close summary "
+            "(since US markets just closed a few hours ago), today's TASI (Saudi market) outlook/open, "
+            "and what to watch for during today's trading sessions (TASI open + US pre-market)."
+        )
+    else:
+        time_context = (
+            "This is the EVENING briefing (7 PM Riyadh time). Focus on: TASI (Saudi market) closing summary "
+            "for today, US market pre-market/early session setup (US markets are about to open or just opened), "
+            "and key events/earnings expected during the US session tonight."
+        )
 
-Format the whole thing as a concise, well-organized message suitable for Telegram (use simple markdown: *bold*, bullet points with -, no headers with #).
-Keep it readable in under 1 minute. Start with a one-line date header."""
+    prompt = f"""Today's date is {today_str}. Generate my detailed financial briefing.
+
+{time_context}
+
+USER CONTEXT:
+- Portfolio is mostly US-listed stocks, with some interest in TASI (Saudi stock market).
+- Sectors of interest: {sectors_str}.
+- NOT interested in: {excluded_str}. Do not bring up or recommend anything in these areas unless directly relevant to a holding the user already owns.
+
+STRUCTURE — cover all of these in detail:
+
+1. **Portfolio summary** — use get_portfolio_summary. Give total gain/loss, and a breakdown per holding (value, day change %, overall gain %). Comment briefly on what's driving notable moves.
+
+2. **US Market Overview** — use get_market_news with query "stock market" and also "US stock market today". Summarize the major indices direction (S&P 500, Nasdaq, Dow) and the main narrative driving the day (Fed, earnings season, macro data, etc).
+
+3. **TASI / Saudi Market Overview** — use get_market_news with query "TASI Saudi stock market" for the latest on the Saudi market — index level, notable movers, any major Saudi economic news (oil policy, Aramco, PIF, etc).
+
+4. **Sector Watch** — for each sector of interest ({sectors_str}), use get_market_news to check for major headlines today (e.g. "oil prices news today", "tech stocks news today", "retail sector news"). Highlight anything significant — especially earnings reports, M&A, regulatory news, or major price-moving events.
+
+5. **News on Your Holdings** — for each stock in the portfolio, use get_market_news with that symbol. Flag earnings dates, analyst rating changes, or major news. Be specific.
+
+6. **Things to Watch / Short-Term Considerations** — based on everything above, give 2-4 specific, detailed observations on potential short-term opportunities or risks (within sectors of interest, and respecting the exclusions above). Frame these as "worth watching" / "consider researching further" — not direct buy/sell instructions.
+
+FORMAT:
+- Use simple Telegram markdown (*bold*, bullet points with -, no # headers)
+- This is the DETAILED version — thoroughness matters more than brevity, but stay organized with clear section breaks
+- Start with a one-line header: the date + which briefing (Morning/Evening)
+- End with a one-line reminder that this is AI-generated analysis, not financial advice"""
 
     messages = [{"role": "user", "content": prompt}]
     reply = run_agent(messages, system_prompt)
@@ -450,7 +502,14 @@ Keep it readable in under 1 minute. Start with a one-line date header."""
     save_memory(updated_profile)
 
     send_telegram_message(clean_reply)
-    print(f"[{datetime.now()}] Briefing sent.")
+    print(f"[{datetime.now()}] {slot.capitalize()} briefing sent.")
+
+
+def morning_briefing():
+    daily_briefing("morning")
+
+def evening_briefing():
+    daily_briefing("evening")
 
 
 # ── FASTAPI APP ────────────────────────────────────────────────────
@@ -483,10 +542,10 @@ async def get_portfolio():
     return get_portfolio_summary()
 
 @app.post("/briefing/test")
-async def test_briefing():
-    """Manually trigger a briefing — useful for testing without waiting for the schedule."""
-    daily_briefing()
-    return {"status": "briefing sent"}
+async def test_briefing(slot: str = "morning"):
+    """Manually trigger a briefing — useful for testing. slot=morning or evening"""
+    daily_briefing(slot)
+    return {"status": "briefing sent", "slot": slot}
 
 @app.get("/")
 async def root():
@@ -495,9 +554,10 @@ async def root():
 
 # ── SCHEDULER ──────────────────────────────────────────────────────
 scheduler = BackgroundScheduler()
-scheduler.add_job(daily_briefing, "cron", hour=BRIEFING_HOUR_UTC, minute=0)
+scheduler.add_job(morning_briefing, "cron", hour=BRIEFING_HOUR_UTC_1, minute=0)
+scheduler.add_job(evening_briefing, "cron", hour=BRIEFING_HOUR_UTC_2, minute=0)
 scheduler.start()
-print(f"Scheduler started — daily briefing at {BRIEFING_HOUR_UTC}:00 UTC")
+print(f"Scheduler started — morning briefing at {BRIEFING_HOUR_UTC_1}:00 UTC, evening at {BRIEFING_HOUR_UTC_2}:00 UTC")
 
 
 # ── RUN ──────────────────────────────────────────────────────────────
