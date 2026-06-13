@@ -1,26 +1,36 @@
 # ============================================================
-# FINANCIAL ADVISOR AGENT — server.py (Stage 3: Tools)
+# FINANCIAL ADVISOR AGENT — Stage 4
+# Portfolio tracking + News + Daily Telegram Briefing
+# Deployed on Railway (always-on)
 # ============================================================
-# NEW IN STAGE 3:
-#   - Tool use: agent can call functions mid-conversation
-#   - get_price: live stock/crypto/commodity prices
-#   - calculate_compound: savings & investment projections
-#   - get_exchange_rate: live currency conversion
 #
-# HOW TOOL USE WORKS:
-#   1. You send a message
-#   2. Claude decides if it needs a tool
-#   3. If yes, it returns a "tool_use" block instead of text
-#   4. Our code runs the tool and sends the result back
-#   5. Claude reads the result and forms the final answer
-#   This loop runs inside /chat — browser sees nothing different
+# WHAT'S NEW vs STAGE 3:
+#   - Portfolio stored in portfolio.json (list of {symbol, shares, cost_basis})
+#   - add_holding / remove_holding tools — agent edits portfolio via chat
+#   - get_market_news tool — fetches headlines for a symbol or general market
+#   - daily_briefing() — builds a full summary and sends to Telegram
+#   - APScheduler runs daily_briefing() once a day automatically
+#   - /chat endpoint still works exactly like Stage 3 for normal conversation
+#
+# FILES IN THIS PROJECT:
+#   main.py            ← this file
+#   requirements.txt   ← dependencies for Railway
+#   portfolio.json     ← created automatically, stores your holdings
+#   memory.json        ← created automatically, stores your profile
+#
+# ENVIRONMENT VARIABLES (set these in Railway dashboard):
+#   ANTHROPIC_API_KEY
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_CHAT_ID
+#   BRIEFING_HOUR_UTC   (e.g. "6" for 6 AM UTC ≈ 9 AM Riyadh)
 # ============================================================
 
 import json
-import math
 import os
 import re
 import urllib.request
+import urllib.parse
+from datetime import datetime
 from pathlib import Path
 
 import anthropic
@@ -28,179 +38,276 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# ── CONFIG ───────────────────────────────────────────────────
-API_KEY      = os.environ.get("ANTHROPIC_API_KEY", "")
-MODEL        = "claude-sonnet-4-5"
+# ── CONFIG (from environment variables) ──────────────────────
+API_KEY            = os.environ["ANTHROPIC_API_KEY"]
+TELEGRAM_TOKEN     = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
+BRIEFING_HOUR_UTC  = int(os.environ.get("BRIEFING_HOUR_UTC", "6"))  # default 6 AM UTC
 
-MEMORY_FILE  = Path("/app/memory.json")
-MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+MODEL = "claude-sonnet-4-5"
 
-# ── TOOL DEFINITIONS ─────────────────────────────────────────
-# This is the list we send to Claude so it knows what tools exist.
-# Claude reads the "description" fields to decide when to use each tool.
+MEMORY_FILE    = Path("memory.json")
+PORTFOLIO_FILE = Path("portfolio.json")
 
+
+# ── STORAGE HELPERS ───────────────────────────────────────────
+def load_json(path: Path, default):
+    if path.exists():
+        return json.loads(path.read_text())
+    return default
+
+def save_json(path: Path, data):
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+def load_memory() -> dict:
+    return load_json(MEMORY_FILE, {})
+
+def save_memory(profile: dict):
+    save_json(MEMORY_FILE, profile)
+
+def load_portfolio() -> list:
+    """Portfolio is a list of: {"symbol": "AAPL", "shares": 10, "cost_basis": 150.0}"""
+    return load_json(PORTFOLIO_FILE, [])
+
+def save_portfolio(portfolio: list):
+    save_json(PORTFOLIO_FILE, portfolio)
+
+
+# ── PRICE / NEWS / FX HELPERS (same as Stage 3, plus news) ────
+def fetch_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+def get_price(symbol: str) -> dict:
+    try:
+        data = fetch_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d")
+        meta = data["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice") or meta.get("previousClose")
+        prev_close = meta.get("previousClose", price)
+        change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
+        return {
+            "symbol": symbol.upper(),
+            "name": meta.get("shortName") or symbol,
+            "price": round(price, 2),
+            "previous_close": round(prev_close, 2),
+            "change_pct": round(change_pct, 2),
+            "currency": meta.get("currency", "USD")
+        }
+    except Exception as e:
+        return {"error": f"Could not fetch price for '{symbol}'. ({e})"}
+
+def calculate_compound(principal: float, annual_rate_pct: float,
+                        years: float, monthly_contribution: float = 0) -> dict:
+    r = (annual_rate_pct / 100) / 12
+    n = int(years * 12)
+    fv_principal = principal * ((1 + r) ** n)
+    if r > 0 and monthly_contribution > 0:
+        fv_contributions = monthly_contribution * (((1 + r) ** n - 1) / r)
+    else:
+        fv_contributions = monthly_contribution * n
+    total = fv_principal + fv_contributions
+    total_invested = principal + (monthly_contribution * n)
+    total_gain = total - total_invested
+    return {
+        "principal": round(principal, 2),
+        "monthly_contribution": round(monthly_contribution, 2),
+        "annual_rate_pct": annual_rate_pct,
+        "years": years,
+        "future_value": round(total, 2),
+        "total_invested": round(total_invested, 2),
+        "total_gain": round(total_gain, 2),
+        "gain_pct": round((total_gain / total_invested * 100) if total_invested else 0, 1)
+    }
+
+def get_exchange_rate(from_currency: str, to_currency: str) -> dict:
+    try:
+        data = fetch_json(f"https://open.er-api.com/v6/latest/{from_currency.upper()}")
+        to = to_currency.upper()
+        if to not in data["rates"]:
+            return {"error": f"Currency '{to}' not found."}
+        rate = data["rates"][to]
+        return {"from": from_currency.upper(), "to": to, "rate": round(rate, 4),
+                "example": f"1 {from_currency.upper()} = {round(rate, 4)} {to}"}
+    except Exception as e:
+        return {"error": f"Could not fetch exchange rate. ({e})"}
+
+def get_market_news(query: str = "stock market") -> dict:
+    """
+    Fetch recent news headlines using Yahoo Finance's search endpoint (free, no key).
+    query can be a symbol (e.g. 'AAPL') or general term (e.g. 'market').
+    """
+    try:
+        q = urllib.parse.quote(query)
+        data = fetch_json(f"https://query1.finance.yahoo.com/v1/finance/search?q={q}&newsCount=6")
+        items = data.get("news", [])[:6]
+        headlines = [{"title": i.get("title"), "publisher": i.get("publisher"),
+                       "link": i.get("link")} for i in items]
+        return {"query": query, "headlines": headlines}
+    except Exception as e:
+        return {"error": f"Could not fetch news. ({e})"}
+
+
+# ── PORTFOLIO TOOLS ────────────────────────────────────────────
+def add_holding(symbol: str, shares: float, cost_basis: float) -> dict:
+    portfolio = load_portfolio()
+    symbol = symbol.upper()
+    for h in portfolio:
+        if h["symbol"] == symbol:
+            # Merge: weighted average cost basis
+            total_shares = h["shares"] + shares
+            total_cost = h["shares"] * h["cost_basis"] + shares * cost_basis
+            h["shares"] = total_shares
+            h["cost_basis"] = round(total_cost / total_shares, 2)
+            save_portfolio(portfolio)
+            return {"status": "updated", "holding": h}
+    portfolio.append({"symbol": symbol, "shares": shares, "cost_basis": cost_basis})
+    save_portfolio(portfolio)
+    return {"status": "added", "holding": portfolio[-1]}
+
+def remove_holding(symbol: str) -> dict:
+    portfolio = load_portfolio()
+    symbol = symbol.upper()
+    new_portfolio = [h for h in portfolio if h["symbol"] != symbol]
+    if len(new_portfolio) == len(portfolio):
+        return {"error": f"{symbol} not found in portfolio."}
+    save_portfolio(new_portfolio)
+    return {"status": "removed", "symbol": symbol}
+
+def get_portfolio_summary() -> dict:
+    portfolio = load_portfolio()
+    if not portfolio:
+        return {"holdings": [], "message": "Portfolio is empty."}
+    results = []
+    total_value = 0
+    total_cost = 0
+    for h in portfolio:
+        price_data = get_price(h["symbol"])
+        if "error" in price_data:
+            results.append({**h, "error": price_data["error"]})
+            continue
+        current_price = price_data["price"]
+        value = current_price * h["shares"]
+        cost = h["cost_basis"] * h["shares"]
+        gain = value - cost
+        gain_pct = (gain / cost * 100) if cost else 0
+        total_value += value
+        total_cost += cost
+        results.append({
+            "symbol": h["symbol"],
+            "shares": h["shares"],
+            "cost_basis": h["cost_basis"],
+            "current_price": current_price,
+            "value": round(value, 2),
+            "gain": round(gain, 2),
+            "gain_pct": round(gain_pct, 2),
+            "day_change_pct": price_data.get("change_pct", 0)
+        })
+    total_gain = total_value - total_cost
+    return {
+        "holdings": results,
+        "total_value": round(total_value, 2),
+        "total_cost": round(total_cost, 2),
+        "total_gain": round(total_gain, 2),
+        "total_gain_pct": round((total_gain / total_cost * 100) if total_cost else 0, 2)
+    }
+
+
+# ── TOOL DEFINITIONS FOR CLAUDE ────────────────────────────────
 TOOLS = [
     {
         "name": "get_price",
-        "description": (
-            "Get the current live price of a stock, cryptocurrency, or commodity. "
-            "Use this whenever the user asks about the price of any asset: "
-            "stocks (e.g. AAPL, TSLA, ARAMCO), crypto (BTC, ETH), or commodities (gold, oil). "
-            "Always use this tool for price questions — never guess a price from memory."
-        ),
+        "description": "Get the current live price of a stock, crypto, or commodity. Use for any price question.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "symbol": {
-                    "type": "string",
-                    "description": "The ticker symbol. Examples: AAPL, BTC-USD, GC=F (gold), CL=F (oil)"
-                }
-            },
+            "properties": {"symbol": {"type": "string", "description": "Ticker symbol, e.g. AAPL, BTC-USD, GC=F"}},
             "required": ["symbol"]
         }
     },
     {
         "name": "calculate_compound",
-        "description": (
-            "Calculate compound interest / investment growth over time. "
-            "Use this when the user wants to know: how much their savings will grow, "
-            "how long to reach a goal, or the impact of monthly contributions. "
-            "Always use real numbers the user has shared."
-        ),
+        "description": "Calculate compound interest / investment growth over time with optional monthly contributions.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "principal":          {"type": "number", "description": "Starting amount (SAR or any currency)"},
-                "annual_rate_pct":    {"type": "number", "description": "Annual interest/return rate as a percentage, e.g. 7 for 7%"},
-                "years":              {"type": "number", "description": "Number of years"},
-                "monthly_contribution":{"type": "number", "description": "Optional monthly deposit amount (default 0)"}
+                "principal": {"type": "number"},
+                "annual_rate_pct": {"type": "number"},
+                "years": {"type": "number"},
+                "monthly_contribution": {"type": "number"}
             },
             "required": ["principal", "annual_rate_pct", "years"]
         }
     },
     {
         "name": "get_exchange_rate",
-        "description": (
-            "Get the current exchange rate between two currencies. "
-            "Use this when the user asks about currency conversion, e.g. USD to SAR, EUR to SAR, etc."
-        ),
+        "description": "Get the current exchange rate between two currencies.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "from_currency": {"type": "string", "description": "Source currency code, e.g. USD"},
-                "to_currency":   {"type": "string", "description": "Target currency code, e.g. SAR"}
+                "from_currency": {"type": "string"},
+                "to_currency": {"type": "string"}
             },
             "required": ["from_currency", "to_currency"]
         }
+    },
+    {
+        "name": "get_market_news",
+        "description": "Get recent news headlines for a stock symbol or general market topic. Use when discussing earnings, market news, or 'what's happening with X'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "Symbol (e.g. AAPL) or topic (e.g. 'stock market', 'Fed interest rates')"}},
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "add_holding",
+        "description": "Add or update a stock holding in the user's portfolio. Use when the user says they bought/own shares of something.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Stock ticker, e.g. AAPL"},
+                "shares": {"type": "number", "description": "Number of shares owned"},
+                "cost_basis": {"type": "number", "description": "Average price per share paid"}
+            },
+            "required": ["symbol", "shares", "cost_basis"]
+        }
+    },
+    {
+        "name": "remove_holding",
+        "description": "Remove a stock from the user's portfolio entirely. Use when the user says they sold all shares of something.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"]
+        }
+    },
+    {
+        "name": "get_portfolio_summary",
+        "description": "Get the user's full portfolio with current values, gains/losses for each holding and in total. Use whenever the user asks about their portfolio, gains, or losses.",
+        "input_schema": {"type": "object", "properties": {}}
     }
 ]
 
-# ── TOOL IMPLEMENTATIONS ─────────────────────────────────────
-# These are the actual Python functions that run when Claude calls a tool.
-
-def get_price(symbol: str) -> dict:
-    """Fetch live price from Yahoo Finance (no API key needed)."""
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
-        meta  = data["chart"]["result"][0]["meta"]
-        price = meta.get("regularMarketPrice") or meta.get("previousClose")
-        currency = meta.get("currency", "USD")
-        name     = meta.get("shortName") or symbol
-        return {
-            "symbol":   symbol.upper(),
-            "name":     name,
-            "price":    round(price, 2),
-            "currency": currency
-        }
-    except Exception as e:
-        return {"error": f"Could not fetch price for '{symbol}'. Try a different symbol. ({e})"}
-
-
-def calculate_compound(principal: float, annual_rate_pct: float,
-                        years: float, monthly_contribution: float = 0) -> dict:
-    """
-    Compound interest with optional monthly contributions.
-    Formula: FV = P*(1+r)^n + PMT * [((1+r)^n - 1) / r]
-    where r = monthly rate, n = months
-    """
-    r = (annual_rate_pct / 100) / 12   # monthly rate
-    n = int(years * 12)                 # total months
-
-    # Future value of lump sum
-    fv_principal = principal * ((1 + r) ** n)
-
-    # Future value of monthly contributions
-    if r > 0 and monthly_contribution > 0:
-        fv_contributions = monthly_contribution * (((1 + r) ** n - 1) / r)
-    else:
-        fv_contributions = monthly_contribution * n
-
-    total = fv_principal + fv_contributions
-    total_invested = principal + (monthly_contribution * n)
-    total_gain = total - total_invested
-
-    return {
-        "principal":           round(principal, 2),
-        "monthly_contribution": round(monthly_contribution, 2),
-        "annual_rate_pct":     annual_rate_pct,
-        "years":               years,
-        "future_value":        round(total, 2),
-        "total_invested":      round(total_invested, 2),
-        "total_gain":          round(total_gain, 2),
-        "gain_pct":            round((total_gain / total_invested * 100) if total_invested else 0, 1)
-    }
-
-
-def get_exchange_rate(from_currency: str, to_currency: str) -> dict:
-    """Fetch live exchange rate from a free public API."""
-    try:
-        url = f"https://open.er-api.com/v6/latest/{from_currency.upper()}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
-        to = to_currency.upper()
-        if to not in data["rates"]:
-            return {"error": f"Currency '{to}' not found."}
-        rate = data["rates"][to]
-        return {
-            "from":      from_currency.upper(),
-            "to":        to,
-            "rate":      round(rate, 4),
-            "example":   f"1 {from_currency.upper()} = {round(rate, 4)} {to}"
-        }
-    except Exception as e:
-        return {"error": f"Could not fetch exchange rate. ({e})"}
-
-
-# Map tool names → functions so we can call them dynamically
 TOOL_FUNCTIONS = {
-    "get_price":          get_price,
+    "get_price": get_price,
     "calculate_compound": calculate_compound,
-    "get_exchange_rate":  get_exchange_rate,
+    "get_exchange_rate": get_exchange_rate,
+    "get_market_news": get_market_news,
+    "add_holding": add_holding,
+    "remove_holding": remove_holding,
+    "get_portfolio_summary": get_portfolio_summary,
 }
 
 def run_tool(name: str, inputs: dict) -> str:
-    """Run a tool by name and return its result as a JSON string."""
     func = TOOL_FUNCTIONS.get(name)
     if not func:
         return json.dumps({"error": f"Unknown tool: {name}"})
-    result = func(**inputs)
-    return json.dumps(result)
+    return json.dumps(func(**inputs))
 
 
-# ── MEMORY HELPERS ───────────────────────────────────────────
-def load_memory() -> dict:
-    if MEMORY_FILE.exists():
-        return json.loads(MEMORY_FILE.read_text())
-    return {}
-
-def save_memory(profile: dict):
-    MEMORY_FILE.write_text(json.dumps(profile, indent=2, ensure_ascii=False))
-
+# ── SYSTEM PROMPT ───────────────────────────────────────────────
 def memory_to_text(profile: dict) -> str:
     if not profile:
         return "No profile yet — this is a new user."
@@ -220,20 +327,15 @@ def build_system_prompt(profile: dict) -> str:
 
 YOUR JOB:
 - Give tailored financial advice based on what you know about this user
-- If this is a new user (no profile), warmly introduce yourself and ask 2-3 questions to understand their situation
-- Give concrete, actionable advice — not vague generalities
-- Use your tools proactively: whenever prices, calculations, or exchange rates are relevant, use the tools — don't guess
+- If this is a new user (no profile), warmly introduce yourself and ask 2-3 questions about their situation
+- Use tools proactively for prices, news, calculations, exchange rates, and portfolio data — never guess
+- When the user mentions buying/owning/selling stocks, use add_holding / remove_holding to keep their portfolio updated
 - Be encouraging but honest about risks
 - Keep responses concise and focused
 - Always remind the user you are an AI, not a licensed financial advisor, for major decisions
 
-TOOLS YOU HAVE:
-- get_price: live price of any stock, crypto, or commodity
-- calculate_compound: investment/savings growth projections
-- get_exchange_rate: live currency conversion rates
-
 MEMORY EXTRACTION:
-After each user message, if you learn new facts about the user's finances, include this block at the END of your response:
+After each user message, if you learn new facts about the user's finances (NOT portfolio holdings — those go through add_holding/remove_holding), include this block at the END of your response:
 
 <memory_update>
 {{
@@ -248,7 +350,8 @@ After each user message, if you learn new facts about the user's finances, inclu
 
 Only include fields you actually learned. Only add this block if there is new information. The user will NOT see this block."""
 
-def extract_and_update_memory(reply_text: str, profile: dict) -> tuple[str, dict]:
+
+def extract_and_update_memory(reply_text: str, profile: dict):
     pattern = r"<memory_update>(.*?)</memory_update>"
     match = re.search(pattern, reply_text, re.DOTALL)
     if match:
@@ -269,82 +372,99 @@ def extract_and_update_memory(reply_text: str, profile: dict) -> tuple[str, dict
     return clean_reply, profile
 
 
-# ── FASTAPI APP ──────────────────────────────────────────────
+# ── AGENT LOOP (shared by /chat and daily briefing) ──────────────
+def run_agent(messages: list, system_prompt: str) -> str:
+    """Runs the full tool-use loop and returns final text."""
+    client = anthropic.Anthropic(api_key=API_KEY)
+    while True:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=2000,
+            system=system_prompt,
+            tools=TOOLS,
+            messages=messages
+        )
+        if response.stop_reason == "end_turn":
+            return "".join(b.text for b in response.content if hasattr(b, "text"))
+
+        if response.stop_reason == "tool_use":
+            messages = messages + [{"role": "assistant", "content": response.content}]
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    print(f"  🔧 {block.name}({block.input})")
+                    result = run_tool(block.name, block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result
+                    })
+            messages = messages + [{"role": "user", "content": tool_results}]
+            continue
+
+        return "Sorry, something went wrong. Please try again."
+
+
+# ── TELEGRAM ─────────────────────────────────────────────────────
+def send_telegram_message(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    # Telegram has a 4096 char limit per message — split if needed
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)] or [text]
+    for chunk in chunks:
+        data = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "parse_mode": "Markdown"
+        }).encode()
+        req = urllib.request.Request(url, data=data)
+        try:
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"Telegram send error: {e}")
+
+
+# ── DAILY BRIEFING ────────────────────────────────────────────────
+def daily_briefing():
+    """Generates and sends the daily market briefing via Telegram."""
+    print(f"[{datetime.now()}] Running daily briefing...")
+    profile = load_memory()
+    system_prompt = build_system_prompt(profile)
+
+    prompt = """Generate my daily financial briefing. Include:
+
+1. **Portfolio summary** — use get_portfolio_summary. Show total gain/loss and each holding's daily change.
+2. **Market overview** — use get_market_news with query "stock market" for general market news today.
+3. **News on my holdings** — for each stock I own, use get_market_news with that symbol to check for any significant news (especially earnings).
+4. **Opportunities** — based on the news and price movements, mention 1-2 potential short-term considerations (NOT direct buy/sell instructions, just things worth watching).
+
+Format the whole thing as a concise, well-organized message suitable for Telegram (use simple markdown: *bold*, bullet points with -, no headers with #).
+Keep it readable in under 1 minute. Start with a one-line date header."""
+
+    messages = [{"role": "user", "content": prompt}]
+    reply = run_agent(messages, system_prompt)
+
+    clean_reply, updated_profile = extract_and_update_memory(reply, profile)
+    save_memory(updated_profile)
+
+    send_telegram_message(clean_reply)
+    print(f"[{datetime.now()}] Briefing sent.")
+
+
+# ── FASTAPI APP ────────────────────────────────────────────────────
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class ChatRequest(BaseModel):
     messages: list[dict]
 
-# ── CHAT ENDPOINT WITH TOOL LOOP ─────────────────────────────
 @app.post("/chat")
 async def chat(request: ChatRequest):
     profile = load_memory()
     system_prompt = build_system_prompt(profile)
-    client = anthropic.Anthropic(api_key=API_KEY)
-
-    messages = request.messages
-
-    # ── AGENT LOOP ───────────────────────────────────────────
-    # We loop because Claude might call multiple tools in one turn.
-    # Each iteration: call Claude → if it wants a tool, run it and loop again
-    # → if it returns text, we're done.
-
-    while True:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=1500,
-            system=system_prompt,
-            tools=TOOLS,           # ← tell Claude what tools are available
-            messages=messages
-        )
-
-        # Claude returned a final text answer — we're done
-        if response.stop_reason == "end_turn":
-            final_text = ""
-            for block in response.content:
-                if hasattr(block, "text"):
-                    final_text += block.text
-            break
-
-        # Claude wants to use one or more tools
-        if response.stop_reason == "tool_use":
-            # Add Claude's response (including tool_use blocks) to history
-            messages = messages + [{"role": "assistant", "content": response.content}]
-
-            # Run each tool Claude requested
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    print(f"  🔧 Tool called: {block.name}({block.input})")
-                    result = run_tool(block.name, block.input)
-                    print(f"  ✓  Result: {result}")
-                    tool_results.append({
-                        "type":        "tool_result",
-                        "tool_use_id": block.id,
-                        "content":     result
-                    })
-
-            # Add tool results to history so Claude can read them
-            messages = messages + [{"role": "user", "content": tool_results}]
-            # Loop again — Claude will now form its final answer using the results
-            continue
-
-        # Unexpected stop reason — break safely
-        final_text = "Sorry, something went wrong. Please try again."
-        break
-
-    # Extract memory updates and clean the reply
-    clean_reply, updated_profile = extract_and_update_memory(final_text, profile)
+    reply = run_agent(request.messages, system_prompt)
+    clean_reply, updated_profile = extract_and_update_memory(reply, profile)
     save_memory(updated_profile)
-
     return {"reply": clean_reply, "profile": updated_profile}
-
 
 @app.get("/memory")
 async def get_memory():
@@ -355,8 +475,29 @@ async def clear_memory():
     save_memory({})
     return {"status": "memory cleared"}
 
+@app.get("/portfolio")
+async def get_portfolio():
+    return get_portfolio_summary()
 
-# ── START ────────────────────────────────────────────────────
+@app.post("/briefing/test")
+async def test_briefing():
+    """Manually trigger a briefing — useful for testing without waiting for the schedule."""
+    daily_briefing()
+    return {"status": "briefing sent"}
+
+@app.get("/")
+async def root():
+    return {"status": "Financial Advisor Agent is running", "time": str(datetime.now())}
+
+
+# ── SCHEDULER ──────────────────────────────────────────────────────
+scheduler = BackgroundScheduler()
+scheduler.add_job(daily_briefing, "cron", hour=BRIEFING_HOUR_UTC, minute=0)
+scheduler.start()
+print(f"Scheduler started — daily briefing at {BRIEFING_HOUR_UTC}:00 UTC")
+
+
+# ── RUN ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
