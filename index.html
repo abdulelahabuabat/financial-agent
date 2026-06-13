@@ -143,7 +143,9 @@
   <aside>
     <div id="api-section">
       <h3>Server URL</h3>
-      <input type="text" id="server-url" placeholder="https://abc123.ngrok-free.app" />
+      <input type="text" id="server-url" placeholder="https://your-app.up.railway.app" value="https://financial-agent-production-8e50.up.railway.app" />
+      <h3 style="margin-top:8px;">Password</h3>
+      <input type="password" id="app-password" placeholder="Enter password" />
       <button onclick="connect()">Connect to server</button>
     </div>
     <div id="profile-section">
@@ -184,11 +186,15 @@ let conversationHistory = [];
 // ── SHARED HEADERS ─────────────────────────────────────────
 // These headers are required by Colab's proxy and ngrok to
 // pass requests through without showing a browser warning page.
-const HEADERS = {
-  "Content-Type": "application/json",
-  "ngrok-skip-browser-warning": "true",
-  "bypass-tunnel-reminder": "true"
-};
+// X-App-Password is checked by the backend for access control.
+function getHeaders() {
+  return {
+    "Content-Type": "application/json",
+    "ngrok-skip-browser-warning": "true",
+    "bypass-tunnel-reminder": "true",
+    "X-App-Password": document.getElementById("app-password").value
+  };
+}
 
 // ── CONNECT ────────────────────────────────────────────────
 async function connect() {
@@ -196,7 +202,8 @@ async function connect() {
   if (!API_BASE) { showError("Please enter a server URL"); return; }
 
   try {
-    const res = await fetch(`${API_BASE}/memory`, { headers: HEADERS });
+    const res = await fetch(`${API_BASE}/memory`, { headers: getHeaders() });
+    if (res.status === 401) throw new Error("Wrong password");
     if (!res.ok) throw new Error("Server not reachable");
 
     setStatus("connected", "Connected ✓");
@@ -208,7 +215,7 @@ async function connect() {
     startConversation();
   } catch (e) {
     setStatus("error", "Connection failed");
-    showError("Cannot reach server. Is it running in Colab?");
+    showError(e.message === "Wrong password" ? "Wrong password" : "Cannot reach server.");
   }
 }
 
@@ -262,7 +269,7 @@ async function sendMessage() {
 async function callServer(messages) {
   const res = await fetch(`${API_BASE}/chat`, {
     method: "POST",
-    headers: HEADERS,
+    headers: getHeaders(),
     body: JSON.stringify({ messages })
   });
   if (!res.ok) {
@@ -343,7 +350,7 @@ async function newSession() {
 async function clearMemory() {
   if (!API_BASE) return;
   if (!confirm("This will erase everything the agent knows about you. Continue?")) return;
-  await fetch(`${API_BASE}/memory`, { method: "DELETE", headers: HEADERS });
+  await fetch(`${API_BASE}/memory`, { method: "DELETE", headers: getHeaders() });
   renderProfile({});
   newSession();
 }
