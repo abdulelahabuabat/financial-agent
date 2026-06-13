@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Financial Advisor Agent</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f5f0; color: #1a1a1a; height: 100vh;
+      display: flex; flex-direction: column;
+    }
+    #app {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      grid-template-rows: 56px 1fr;
+      height: 100vh;
+    }
+    header {
+      grid-column: 1 / -1; background: #fff;
+      border-bottom: 1px solid #e8e8e4;
+      display: flex; align-items: center; padding: 0 20px; gap: 12px;
+    }
+    header .logo {
+      width: 32px; height: 32px; border-radius: 8px; background: #1a1a1a;
+      display: flex; align-items: center; justify-content: center;
+      color: #fff; font-size: 16px;
+    }
+    header h1 { font-size: 15px; font-weight: 600; }
+    header .subtitle { font-size: 12px; color: #888; margin-left: 4px; }
+    #connection-status {
+      margin-left: auto; font-size: 12px; padding: 4px 10px;
+      border-radius: 99px; border: 1px solid #e8e8e4;
+    }
+    #connection-status.connected { color: #2d7a4f; background: #edf7f1; border-color: #b5dfc8; }
+    #connection-status.error { color: #c0392b; background: #fdf0ef; border-color: #f5b7b1; }
+    aside {
+      background: #fff; border-right: 1px solid #e8e8e4;
+      padding: 16px; overflow-y: auto;
+      display: flex; flex-direction: column; gap: 16px;
+    }
+    aside h3 { font-size: 11px; font-weight: 600; color: #999; text-transform: uppercase; letter-spacing: 0.06em; }
+    #api-section input {
+      width: 100%; font-size: 12px; padding: 7px 10px;
+      border: 1px solid #e8e8e4; border-radius: 8px;
+      background: #fafafa; margin: 6px 0 4px; color: #1a1a1a;
+    }
+    #api-section button {
+      width: 100%; font-size: 12px; padding: 7px;
+      border: 1px solid #e8e8e4; border-radius: 8px;
+      background: #1a1a1a; color: #fff; cursor: pointer;
+    }
+    #api-section button:hover { background: #333; }
+    #profile-section { flex: 1; }
+    #profile-box {
+      background: #fafafa; border: 1px solid #e8e8e4;
+      border-radius: 10px; padding: 10px 12px;
+      font-size: 12px; line-height: 1.8; min-height: 80px; color: #555;
+    }
+    #profile-box .fact { display: flex; gap: 6px; }
+    #profile-box .fact .key { color: #999; min-width: 80px; }
+    #profile-box .fact .val { color: #1a1a1a; font-weight: 500; }
+    #profile-box .empty { color: #aaa; font-style: italic; font-size: 12px; }
+    .sidebar-btn {
+      font-size: 12px; padding: 7px 12px;
+      border: 1px solid #e8e8e4; border-radius: 8px;
+      background: transparent; cursor: pointer; width: 100%;
+      color: #555; text-align: left;
+    }
+    .sidebar-btn:hover { background: #f5f5f0; }
+    .sidebar-btn.danger { color: #c0392b; border-color: #f5b7b1; }
+    .sidebar-btn.danger:hover { background: #fdf0ef; }
+    main { display: flex; flex-direction: column; overflow: hidden; }
+    #messages {
+      flex: 1; overflow-y: auto; padding: 20px;
+      display: flex; flex-direction: column; gap: 16px;
+    }
+    .msg { display: flex; gap: 10px; align-items: flex-start; max-width: 720px; }
+    .msg.user { flex-direction: row-reverse; margin-left: auto; }
+    .msg.user .bubble {
+      background: #1a1a1a; color: #fff;
+      border-radius: 18px 18px 4px 18px;
+    }
+    .msg.assistant .bubble {
+      background: #fff; color: #1a1a1a;
+      border: 1px solid #e8e8e4;
+      border-radius: 18px 18px 18px 4px;
+    }
+    .bubble { padding: 12px 16px; font-size: 14px; line-height: 1.65; max-width: 580px; white-space: pre-wrap; }
+    .avatar {
+      width: 30px; height: 30px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 600; flex-shrink: 0; margin-top: 2px;
+    }
+    .msg.assistant .avatar { background: #edf7f1; color: #2d7a4f; }
+    .msg.user .avatar { background: #e8e8e4; color: #555; }
+    #typing-indicator { display: none; align-items: center; gap: 8px; padding: 0 20px 8px; }
+    #typing-indicator.visible { display: flex; }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: #aaa; animation: pulse 1.2s infinite; }
+    .dot:nth-child(2) { animation-delay: 0.2s; }
+    .dot:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes pulse { 0%,60%,100% { opacity: 0.3; } 30% { opacity: 1; } }
+    #typing-text { font-size: 12px; color: #aaa; }
+    #input-bar {
+      padding: 12px 20px 16px; background: #fff;
+      border-top: 1px solid #e8e8e4;
+      display: flex; gap: 10px; align-items: flex-end;
+    }
+    #input-bar textarea {
+      flex: 1; font-size: 14px; padding: 10px 14px;
+      border: 1px solid #e8e8e4; border-radius: 12px;
+      background: #fafafa; resize: none; height: 44px;
+      max-height: 120px; line-height: 1.5; color: #1a1a1a; font-family: inherit;
+    }
+    #input-bar textarea:focus { outline: none; border-color: #aaa; background: #fff; }
+    #send-btn {
+      width: 44px; height: 44px; border-radius: 12px;
+      background: #1a1a1a; color: #fff; border: none;
+      cursor: pointer; display: flex; align-items: center;
+      justify-content: center; flex-shrink: 0; font-size: 18px;
+    }
+    #send-btn:disabled { background: #ccc; cursor: not-allowed; }
+    #send-btn:hover:not(:disabled) { background: #333; }
+    #error-toast {
+      display: none; position: fixed; bottom: 80px; left: 50%;
+      transform: translateX(-50%);
+      background: #c0392b; color: #fff; font-size: 13px;
+      padding: 10px 20px; border-radius: 8px; z-index: 999;
+    }
+    #error-toast.visible { display: block; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="logo">💰</div>
+    <h1>Financial Advisor Agent</h1>
+    <span class="subtitle">Stage 2 — with memory</span>
+    <span id="connection-status">Not connected</span>
+  </header>
+
+  <aside>
+    <div id="api-section">
+      <h3>Server URL</h3>
+      <input type="text" id="server-url" placeholder="https://abc123.ngrok-free.app" />
+      <button onclick="connect()">Connect to server</button>
+    </div>
+    <div id="profile-section">
+      <h3>What I know about you</h3>
+      <div id="profile-box">
+        <span class="empty">Connect to see your profile</span>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px;">
+      <button class="sidebar-btn" onclick="newSession()">↺ New session</button>
+      <button class="sidebar-btn danger" onclick="clearMemory()">🗑 Clear memory</button>
+    </div>
+  </aside>
+
+  <main>
+    <div id="messages">
+      <div id="placeholder" style="text-align:center; color:#aaa; font-size:13px; margin-top:40px;">
+        Enter your server URL in the sidebar and click Connect
+      </div>
+    </div>
+    <div id="typing-indicator">
+      <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+      <span id="typing-text">Thinking...</span>
+    </div>
+    <div id="input-bar">
+      <textarea id="user-input" placeholder="Ask your financial advisor..." disabled onkeydown="handleKey(event)"></textarea>
+      <button id="send-btn" disabled onclick="sendMessage()">➤</button>
+    </div>
+  </main>
+</div>
+
+<div id="error-toast"></div>
+
+<script>
+let API_BASE = "";
+let conversationHistory = [];
+
+// ── SHARED HEADERS ─────────────────────────────────────────
+// These headers are required by Colab's proxy and ngrok to
+// pass requests through without showing a browser warning page.
+const HEADERS = {
+  "Content-Type": "application/json",
+  "ngrok-skip-browser-warning": "true",
+  "bypass-tunnel-reminder": "true"
+};
+
+// ── CONNECT ────────────────────────────────────────────────
+async function connect() {
+  API_BASE = document.getElementById("server-url").value.trim().replace(/\/$/, "");
+  if (!API_BASE) { showError("Please enter a server URL"); return; }
+
+  try {
+    const res = await fetch(`${API_BASE}/memory`, { headers: HEADERS });
+    if (!res.ok) throw new Error("Server not reachable");
+
+    setStatus("connected", "Connected ✓");
+    document.getElementById("user-input").disabled = false;
+    document.getElementById("send-btn").disabled = false;
+
+    const profile = await res.json();
+    renderProfile(profile);
+    startConversation();
+  } catch (e) {
+    setStatus("error", "Connection failed");
+    showError("Cannot reach server. Is it running in Colab?");
+  }
+}
+
+// ── START CONVERSATION ─────────────────────────────────────
+async function startConversation() {
+  clearMessages();
+  showTyping(true);
+  try {
+    const data = await callServer([{ role: "user", content: "__start__" }]);
+    showTyping(false);
+    conversationHistory = [];
+    conversationHistory.push({ role: "assistant", content: data.reply });
+    addBubble("assistant", data.reply);
+    renderProfile(data.profile);
+  } catch (e) {
+    showTyping(false);
+    showError(e.message);
+  }
+}
+
+// ── SEND MESSAGE ───────────────────────────────────────────
+async function sendMessage() {
+  const input = document.getElementById("user-input");
+  const text = input.value.trim();
+  if (!text || !API_BASE) return;
+
+  input.value = "";
+  input.style.height = "44px";
+
+  addBubble("user", text);
+  conversationHistory.push({ role: "user", content: text });
+
+  showTyping(true);
+  document.getElementById("send-btn").disabled = true;
+
+  try {
+    const data = await callServer(conversationHistory);
+    showTyping(false);
+    conversationHistory.push({ role: "assistant", content: data.reply });
+    addBubble("assistant", data.reply);
+    renderProfile(data.profile);
+  } catch (e) {
+    showTyping(false);
+    showError(e.message);
+  }
+
+  document.getElementById("send-btn").disabled = false;
+}
+
+// ── CALL SERVER ────────────────────────────────────────────
+async function callServer(messages) {
+  const res = await fetch(`${API_BASE}/chat`, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify({ messages })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Server error ${res.status}`);
+  }
+  return res.json();
+}
+
+// ── RENDER PROFILE ─────────────────────────────────────────
+function renderProfile(profile) {
+  const box = document.getElementById("profile-box");
+  if (!profile || Object.keys(profile).length === 0) {
+    box.innerHTML = '<span class="empty">Nothing saved yet — start chatting!</span>';
+    return;
+  }
+  const labels = {
+    name: "Name", monthly_income: "Income", goals: "Goals",
+    debts: "Debts", risk_tolerance: "Risk", notes: "Notes"
+  };
+  box.innerHTML = Object.entries(profile).map(([k, v]) => {
+    const label = labels[k] || k;
+    const val = Array.isArray(v) ? v.join(", ") : v;
+    return `<div class="fact"><span class="key">${label}</span><span class="val">${val}</span></div>`;
+  }).join("");
+}
+
+// ── UI HELPERS ─────────────────────────────────────────────
+function addBubble(role, text) {
+  const container = document.getElementById("messages");
+  const placeholder = document.getElementById("placeholder");
+  if (placeholder) placeholder.remove();
+
+  const wrapper = document.createElement("div");
+  wrapper.className = `msg ${role}`;
+
+  const avatar = document.createElement("div");
+  avatar.className = "avatar";
+  avatar.textContent = role === "assistant" ? "AI" : "You";
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.textContent = text;
+
+  wrapper.appendChild(avatar);
+  wrapper.appendChild(bubble);
+  container.appendChild(wrapper);
+  container.scrollTop = container.scrollHeight;
+}
+
+function clearMessages() {
+  document.getElementById("messages").innerHTML = "";
+}
+
+function showTyping(visible) {
+  document.getElementById("typing-indicator").classList.toggle("visible", visible);
+}
+
+function setStatus(type, text) {
+  const el = document.getElementById("connection-status");
+  el.textContent = text;
+  el.className = type;
+}
+
+function showError(msg) {
+  const toast = document.getElementById("error-toast");
+  toast.textContent = msg;
+  toast.classList.add("visible");
+  setTimeout(() => toast.classList.remove("visible"), 5000);
+}
+
+async function newSession() {
+  conversationHistory = [];
+  clearMessages();
+  if (API_BASE) startConversation();
+}
+
+async function clearMemory() {
+  if (!API_BASE) return;
+  if (!confirm("This will erase everything the agent knows about you. Continue?")) return;
+  await fetch(`${API_BASE}/memory`, { method: "DELETE", headers: HEADERS });
+  renderProfile({});
+  newSession();
+}
+
+function handleKey(e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+document.getElementById("user-input").addEventListener("input", function () {
+  this.style.height = "44px";
+  this.style.height = Math.min(this.scrollHeight, 120) + "px";
+});
+</script>
+</body>
+</html>
