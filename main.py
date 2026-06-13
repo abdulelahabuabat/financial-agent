@@ -48,8 +48,10 @@ BRIEFING_HOUR_UTC  = int(os.environ.get("BRIEFING_HOUR_UTC", "6"))  # default 6 
 
 MODEL = "claude-sonnet-4-5"
 
-MEMORY_FILE    = Path("memory.json")
-PORTFOLIO_FILE = Path("portfolio.json")
+DATA_DIR = Path("/data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+MEMORY_FILE    = DATA_DIR / "memory.json"
+PORTFOLIO_FILE = DATA_DIR / "portfolio.json"
 
 
 # ── STORAGE HELPERS ───────────────────────────────────────────
@@ -430,7 +432,8 @@ def daily_briefing():
     profile = load_memory()
     system_prompt = build_system_prompt(profile)
 
-    prompt = """Generate my daily financial briefing. Include:
+    today_str = datetime.now().strftime("%A, %B %d, %Y")
+    prompt = f"""Today's date is {today_str}. Generate my daily financial briefing for today. Include:
 
 1. **Portfolio summary** — use get_portfolio_summary. Show total gain/loss and each holding's daily change.
 2. **Market overview** — use get_market_news with query "stock market" for general market news today.
