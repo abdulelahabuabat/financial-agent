@@ -413,19 +413,35 @@ def run_agent(messages: list, system_prompt: str) -> str:
 # ── TELEGRAM ─────────────────────────────────────────────────────
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    # Telegram has a 4096 char limit per message — split if needed
-    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)] or [text]
+    # Split into chunks under 4000 chars, breaking at newlines where possible
+    chunks = []
+    while len(text) > 4000:
+        split_at = text.rfind("\n", 0, 4000)  # try to split at a newline
+        if split_at == -1:
+            split_at = 4000  # fallback: hard split
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    chunks.append(text)
+
     for chunk in chunks:
-        data = urllib.parse.urlencode({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": chunk,
-            "parse_mode": "Markdown"
-        }).encode()
-        req = urllib.request.Request(url, data=data)
-        try:
-            urllib.request.urlopen(req, timeout=10)
-        except Exception as e:
-            print(f"Telegram send error: {e}")
+        if not chunk.strip():
+            continue
+        # Try with Markdown first, fall back to plain text if it fails
+        for parse_mode in ["Markdown", ""]:
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk}
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            data = urllib.parse.urlencode(payload).encode()
+            req = urllib.request.Request(url, data=data)
+            try:
+                urllib.request.urlopen(req, timeout=10)
+                break  # success, move to next chunk
+            except Exception as e:
+                if parse_mode == "Markdown":
+                    print(f"Markdown send failed, retrying as plain text: {e}")
+                    continue  # retry without markdown
+                else:
+                    print(f"Telegram send error: {e}")
 
 
 # ── USER BRIEFING PREFERENCES ────────────────────────────────────
