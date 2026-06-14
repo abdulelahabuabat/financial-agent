@@ -411,35 +411,72 @@ def run_agent(messages: list, system_prompt: str) -> str:
 
 
 # ── TELEGRAM ─────────────────────────────────────────────────────
+def format_for_telegram_html(text: str) -> str:
+    """
+    Convert the agent's plain text output into Telegram HTML formatting.
+    Rules:
+    - Lines that look like section headers (ALL CAPS, or ending with :) → <b>bold</b>
+    - Lines starting with - → bullet point with a dot emoji
+    - Escape HTML special characters to avoid parse errors
+    """
+    import html
+    lines = text.split("\n")
+    formatted = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            formatted.append("")
+            continue
+        # Escape HTML special chars first
+        safe = html.escape(stripped)
+        # Section headers: ALL CAPS line, or line ending with colon, or starts with a number + dot
+        if (stripped.isupper() and len(stripped) > 3) or \
+           (stripped.endswith(":") and len(stripped) < 60) or \
+           (len(stripped) > 2 and stripped[0].isdigit() and stripped[1] in ".):"):
+            formatted.append(f"\n<b>{safe}</b>")
+        # Bullet points
+        elif stripped.startswith("- "):
+            formatted.append(f"• {html.escape(stripped[2:])}")
+        else:
+            formatted.append(safe)
+    return "\n".join(formatted).strip()
+
+
 def send_telegram_message(text: str):
-    """Send a plain text message to Telegram, splitting if over 4000 chars."""
+    """Send an HTML-formatted message to Telegram, splitting if over 4000 chars."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    # Strip any markdown symbols that could cause parse errors
-    clean = text.replace("*", "").replace("_", "").replace("`", "").replace("[", "").replace("]", "")
+    formatted = format_for_telegram_html(text)
 
     # Split at newlines if over 4000 chars
     chunks = []
-    while len(clean) > 4000:
-        split_at = clean.rfind("\n", 0, 4000)
+    while len(formatted) > 4000:
+        split_at = formatted.rfind("\n", 0, 4000)
         if split_at == -1:
             split_at = 4000
-        chunks.append(clean[:split_at])
-        clean = clean[split_at:].lstrip("\n")
-    chunks.append(clean)
+        chunks.append(formatted[:split_at])
+        formatted = formatted[split_at:].lstrip("\n")
+    chunks.append(formatted)
 
     for chunk in chunks:
         if not chunk.strip():
             continue
-        data = urllib.parse.urlencode({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": chunk
-        }).encode()
-        req = urllib.request.Request(url, data=data)
-        try:
-            urllib.request.urlopen(req, timeout=10)
-        except Exception as e:
-            print(f"Telegram send error: {e}")
+        # Try HTML mode first, fall back to plain text
+        for parse_mode in ["HTML", ""]:
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk}
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            data = urllib.parse.urlencode(payload).encode()
+            req = urllib.request.Request(url, data=data)
+            try:
+                urllib.request.urlopen(req, timeout=10)
+                break
+            except Exception as e:
+                if parse_mode == "HTML":
+                    print(f"HTML send failed, retrying as plain text: {e}")
+                    continue
+                else:
+                    print(f"Telegram send error: {e}")
 
 
 # ── USER BRIEFING PREFERENCES ────────────────────────────────────
@@ -492,10 +529,10 @@ def daily_briefing(slot: str = "morning"):
         f"3. For each sector ({sectors_str}), call get_market_news with that sector plus 'stocks news' - one sentence per sector on what is happening.\n\n"
         "4. For each stock in my portfolio, call get_market_news with that ticker - flag any earnings, analyst upgrades/downgrades, or major news. One line per stock.\n\n"
         "5. Based on everything above, give 2-3 short observations on things worth watching (opportunities or risks). No buy/sell recommendations.\n\n"
-        "IMPORTANT FORMAT RULES:\n"
-        "- Plain text only, NO asterisks, NO underscores, NO markdown at all\n"
+        "FORMAT RULES:\n"
         "- Use dashes (-) for bullet points\n"
-        "- Keep each section short and scannable\n"
+        "- Start each section with a short ALL CAPS label followed by a colon (e.g. PORTFOLIO:, MARKET:, SECTORS:, YOUR STOCKS:, WATCH:)\n"
+        "- Plain text only inside bullets — no asterisks or underscores\n"
         f"- Start with: {today_str} - {slot.upper()} BRIEFING\n"
         "- End with: This is AI analysis, not financial advice.\n"
         "- Total length: aim for under 2000 characters"
