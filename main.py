@@ -412,36 +412,34 @@ def run_agent(messages: list, system_prompt: str) -> str:
 
 # ── TELEGRAM ─────────────────────────────────────────────────────
 def send_telegram_message(text: str):
+    """Send a plain text message to Telegram, splitting if over 4000 chars."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    # Split into chunks under 4000 chars, breaking at newlines where possible
+
+    # Strip any markdown symbols that could cause parse errors
+    clean = text.replace("*", "").replace("_", "").replace("`", "").replace("[", "").replace("]", "")
+
+    # Split at newlines if over 4000 chars
     chunks = []
-    while len(text) > 4000:
-        split_at = text.rfind("\n", 0, 4000)  # try to split at a newline
+    while len(clean) > 4000:
+        split_at = clean.rfind("\n", 0, 4000)
         if split_at == -1:
-            split_at = 4000  # fallback: hard split
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
-    chunks.append(text)
+            split_at = 4000
+        chunks.append(clean[:split_at])
+        clean = clean[split_at:].lstrip("\n")
+    chunks.append(clean)
 
     for chunk in chunks:
         if not chunk.strip():
             continue
-        # Try with Markdown first, fall back to plain text if it fails
-        for parse_mode in ["Markdown", ""]:
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk}
-            if parse_mode:
-                payload["parse_mode"] = parse_mode
-            data = urllib.parse.urlencode(payload).encode()
-            req = urllib.request.Request(url, data=data)
-            try:
-                urllib.request.urlopen(req, timeout=10)
-                break  # success, move to next chunk
-            except Exception as e:
-                if parse_mode == "Markdown":
-                    print(f"Markdown send failed, retrying as plain text: {e}")
-                    continue  # retry without markdown
-                else:
-                    print(f"Telegram send error: {e}")
+        data = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk
+        }).encode()
+        req = urllib.request.Request(url, data=data)
+        try:
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"Telegram send error: {e}")
 
 
 # ── USER BRIEFING PREFERENCES ────────────────────────────────────
@@ -459,8 +457,8 @@ EXCLUDED_AREAS = [
 def daily_briefing(slot: str = "morning"):
     """
     Generates and sends a market briefing via Telegram.
-    slot: "morning" (pre-market/open focus, 9 AM Riyadh) or
-          "evening" (recap of US session + TASI close, 7 PM Riyadh)
+    slot: "morning" (9 AM Riyadh, pre-US market open) or
+          "evening" (7 PM Riyadh, US market open/early session)
     """
     print(f"[{datetime.now()}] Running {slot} briefing...")
     profile = load_memory()
@@ -472,45 +470,36 @@ def daily_briefing(slot: str = "morning"):
 
     if slot == "morning":
         time_context = (
-            "This is the MORNING briefing (9 AM Riyadh time). Focus on: overnight US market close summary "
-            "(since US markets just closed a few hours ago), today's TASI (Saudi market) outlook/open, "
-            "and what to watch for during today's trading sessions (TASI open + US pre-market)."
+            "MORNING briefing (9 AM Riyadh). US markets closed a few hours ago. "
+            "Focus on: what happened overnight in US markets, pre-market movers, "
+            "and key things to watch when US markets open tonight."
         )
     else:
         time_context = (
-            "This is the EVENING briefing (7 PM Riyadh time). Focus on: TASI (Saudi market) closing summary "
-            "for today, US market pre-market/early session setup (US markets are about to open or just opened), "
-            "and key events/earnings expected during the US session tonight."
+            "EVENING briefing (7 PM Riyadh). US markets just opened or are about to open. "
+            "Focus on: current US market direction, early session movers, "
+            "and what to watch for the rest of the US session tonight."
         )
 
-    prompt = f"""Today's date is {today_str}. Generate my detailed financial briefing.
-
-{time_context}
-
-USER CONTEXT:
-- Portfolio is mostly US-listed stocks, with some interest in TASI (Saudi stock market).
-- Sectors of interest: {sectors_str}.
-- NOT interested in: {excluded_str}. Do not bring up or recommend anything in these areas unless directly relevant to a holding the user already owns.
-
-STRUCTURE — cover all of these in detail:
-
-1. **Portfolio summary** — use get_portfolio_summary. Give total gain/loss, and a breakdown per holding (value, day change %, overall gain %). Comment briefly on what's driving notable moves.
-
-2. **US Market Overview** — use get_market_news with query "stock market" and also "US stock market today". Summarize the major indices direction (S&P 500, Nasdaq, Dow) and the main narrative driving the day (Fed, earnings season, macro data, etc).
-
-3. **TASI / Saudi Market Overview** — use get_market_news with query "TASI Saudi stock market" for the latest on the Saudi market — index level, notable movers, any major Saudi economic news (oil policy, Aramco, PIF, etc).
-
-4. **Sector Watch** — for each sector of interest ({sectors_str}), use get_market_news to check for major headlines today (e.g. "oil prices news today", "tech stocks news today", "retail sector news"). Highlight anything significant — especially earnings reports, M&A, regulatory news, or major price-moving events.
-
-5. **News on Your Holdings** — for each stock in the portfolio, use get_market_news with that symbol. Flag earnings dates, analyst rating changes, or major news. Be specific.
-
-6. **Things to Watch / Short-Term Considerations** — based on everything above, give 2-4 specific, detailed observations on potential short-term opportunities or risks (within sectors of interest, and respecting the exclusions above). Frame these as "worth watching" / "consider researching further" — not direct buy/sell instructions.
-
-FORMAT:
-- Use simple Telegram markdown (*bold*, bullet points with -, no # headers)
-- This is the DETAILED version — thoroughness matters more than brevity, but stay organized with clear section breaks
-- Start with a one-line header: the date + which briefing (Morning/Evening)
-- End with a one-line reminder that this is AI-generated analysis, not financial advice"""
+    prompt = (
+        f"Today is {today_str}. Generate my US stock market briefing.\n\n"
+        f"Context: {time_context}\n\n"
+        f"My portfolio is US-listed stocks. Sectors I care about: {sectors_str}.\n"
+        f"Do NOT mention: {excluded_str}.\n\n"
+        "Do the following steps IN ORDER using your tools:\n\n"
+        "1. Call get_portfolio_summary - show each holding: current price, day change %, total gain/loss. Then give total portfolio value and overall gain/loss.\n\n"
+        "2. Call get_market_news with 'US stock market today' - summarize the main market narrative in 3-4 sentences (indices, Fed news, macro data, anything moving the market).\n\n"
+        f"3. For each sector ({sectors_str}), call get_market_news with that sector plus 'stocks news' - one sentence per sector on what is happening.\n\n"
+        "4. For each stock in my portfolio, call get_market_news with that ticker - flag any earnings, analyst upgrades/downgrades, or major news. One line per stock.\n\n"
+        "5. Based on everything above, give 2-3 short observations on things worth watching (opportunities or risks). No buy/sell recommendations.\n\n"
+        "IMPORTANT FORMAT RULES:\n"
+        "- Plain text only, NO asterisks, NO underscores, NO markdown at all\n"
+        "- Use dashes (-) for bullet points\n"
+        "- Keep each section short and scannable\n"
+        f"- Start with: {today_str} - {slot.upper()} BRIEFING\n"
+        "- End with: This is AI analysis, not financial advice.\n"
+        "- Total length: aim for under 2000 characters"
+    )
 
     messages = [{"role": "user", "content": prompt}]
     reply = run_agent(messages, system_prompt)
@@ -527,8 +516,6 @@ def morning_briefing():
 
 def evening_briefing():
     daily_briefing("evening")
-
-
 # ── FASTAPI APP ────────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
